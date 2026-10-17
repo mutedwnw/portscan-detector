@@ -1,4 +1,5 @@
 window_seconds: 60
+syn_ack_timeout_seconds: 5
 
 thresholds:
   vertical_unique_ports: 20

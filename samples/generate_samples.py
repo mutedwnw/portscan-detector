@@ -36,6 +36,14 @@ def create_sample_rows() -> list[dict[str, str]]:
             flags="SYN",
         )
 
+        add_event(
+            seconds=index * 3 + 1,
+            src_ip=f"192.0.2.{source_number}",
+            dst_ip=f"198.51.100.{destination_number}",
+            dst_port=[22, 53, 80, 443][index % 4],
+            flags="ACK",
+        )
+
     # Vertical scan: one source probes many ports on one destination.
     for index, port in enumerate(range(20, 42)):
         add_event(40 + index * 2, "203.0.113.10", "198.51.100.10", port, "SYN")
@@ -54,7 +62,9 @@ def create_sample_rows() -> list[dict[str, str]]:
     for index in range(22):
         add_event(160 + index * 2, "203.0.113.30", "198.51.100.60", 443, "SYN")
 
-    return rows
+    # A later observed TCP event lets the final SYN attempts reach their deadline.
+    add_event(208, "192.0.2.10", "198.51.100.20", 443, "ACK")
+    return sorted(rows, key=lambda row: row["timestamp"])
 
 
 def write_samples(output_path: Path) -> None:
@@ -62,7 +72,7 @@ def write_samples(output_path: Path) -> None:
     fields = ["timestamp", "src_ip", "dst_ip", "dst_port", "flags"]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8", newline="") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fields)
+        writer = csv.DictWriter(csv_file, fieldnames=fields, lineterminator="\n")
         writer.writeheader()
         writer.writerows(create_sample_rows())
 

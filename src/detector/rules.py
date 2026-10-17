@@ -1,17 +1,19 @@
-"""Sliding-window rules for detecting port-scanning behavior."""
+"""Offline TCP scan detection with bounded sliding-window state."""
 
 from __future__ import annotations
 
-from collections import deque
+from collections import Counter, deque
+from collections.abc import Callable, Hashable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from itertools import groupby
 
 from detector.parser import Event
 
 
 @dataclass(frozen=True)
 class Alert:
-    """A detection produced by one of the scan rules."""
+    """A threshold crossing; count and times describe its triggering window."""
 
     rule: str
     src_ip: str
@@ -24,147 +26,115 @@ class Alert:
 
 
 def _has_flag(flags: str, wanted_flag: str) -> bool:
-    """Check a comma- or space-separated flag field for one flag token."""
-    flag_tokens = flags.replace(",", " ").split()
-    return wanted_flag in flag_tokens
+    """Check a comma- or space-separated flag field for one token."""
+    return wanted_flag in flags.upper().replace(",", " ").split()
 
 
-def _remove_expired(
-    events: deque[Event], current_time: datetime, window: timedelta
-) -> None:
-    """Discard events older than the window ending at current_time."""
-    while events and current_time - events[0].timestamp > window:
-        events.popleft()
+def _is_probe(event: Event) -> bool:
+    """Only an initial SYN represents a new TCP connection attempt."""
+    return _has_flag(event.flags, "SYN") and not _has_flag(event.flags, "ACK")
 
 
-def _detect_vertical(
-    events: list[Event], window: timedelta, threshold: int
+def _detect_window(
+    events: list[Event],
+    window: timedelta,
+    threshold: int,
+    rule: str,
+    group_key: Callable[[Event], Hashable],
+    value_key: Callable[[Event], Hashable] | None,
+    target: Callable[[Event], str],
+    unit: str,
 ) -> list[Alert]:
-    """Find one source probing many ports on the same destination."""
-    windows: dict[tuple[str, str], deque[Event]] = {}
-    alerted_groups: set[tuple[str, str]] = set()
+    """Count values incrementally; expire all groups and rearm below threshold."""
+    timeline: deque[Event] = deque()
+    groups: dict[Hashable, deque[Event]] = {}
+    counts: dict[Hashable, Counter[Hashable]] = {}
+    alerted: set[Hashable] = set()
     alerts: list[Alert] = []
 
+    def count(key: Hashable) -> int:
+        return len(counts[key]) if value_key else len(groups[key])
+
     for event in events:
-        key = (event.src_ip, event.dst_ip)
-        current = windows.setdefault(key, deque())
-        _remove_expired(current, event.timestamp, window)
-        if not current:
-            alerted_groups.discard(key)
-        current.append(event)
+        # Global expiration also clears groups that never send another event.
+        while timeline and event.timestamp - timeline[0].timestamp > window:
+            expired = timeline.popleft()
+            key = group_key(expired)
+            groups[key].popleft()
+            if value_key:
+                value = value_key(expired)
+                counts[key][value] -= 1
+                if counts[key][value] == 0:
+                    del counts[key][value]
+            if count(key) < threshold:
+                alerted.discard(key)
+            if not groups[key]:
+                del groups[key]
+                del counts[key]
 
-        unique_ports = {item.dst_port for item in current}
-        if len(unique_ports) >= threshold and key not in alerted_groups:
-            alerts.append(
-                Alert(
-                    rule="vertical_scan",
-                    src_ip=event.src_ip,
-                    target=event.dst_ip,
-                    first_seen=current[0].timestamp,
-                    last_seen=event.timestamp,
-                    event_count=len(unique_ports),
-                    description=(
-                        f"{len(unique_ports)} unique destination ports on "
-                        f"{event.dst_ip} within the time window"
-                    ),
-                )
-            )
-            alerted_groups.add(key)
-
+        key = group_key(event)
+        groups.setdefault(key, deque()).append(event)
+        counts.setdefault(key, Counter())
+        timeline.append(event)
+        if value_key:
+            counts[key][value_key(event)] += 1
+        total = count(key)
+        if total >= threshold and key not in alerted:
+            alerts.append(Alert(
+                rule=rule,
+                src_ip=event.src_ip,
+                target=target(event),
+                first_seen=groups[key][0].timestamp,
+                last_seen=event.timestamp,
+                event_count=total,
+                description=f"{total} {unit} in the triggering time window",
+            ))
+            alerted.add(key)
     return alerts
 
 
-def _detect_horizontal(
-    events: list[Event], window: timedelta, threshold: int
-) -> list[Alert]:
-    """Find one source probing many destinations on the same port."""
-    windows: dict[tuple[str, int], deque[Event]] = {}
-    alerted_groups: set[tuple[str, int]] = set()
-    alerts: list[Alert] = []
+def _unacknowledged_syns(events: list[Event], timeout: timedelta) -> list[Event]:
+    """Return SYNs whose ACK deadline passed during the observed TCP timeline.
 
-    for event in events:
-        key = (event.src_ip, event.dst_port)
-        current = windows.setdefault(key, deque())
-        _remove_expired(current, event.timestamp, window)
-        if not current:
-            alerted_groups.discard(key)
-        current.append(event)
+    ACKs at the deadline are accepted. Events sharing a timestamp are treated
+    as simultaneous, allowing logs with coarse timestamp resolution. Pending
+    SYNs at the end of the recording are not assumed to have timed out.
+    """
+    pending: dict[tuple[str, str, int, int | None], dict[int, Event]] = {}
+    deadlines: deque[tuple[int, Event]] = deque()
+    expired: list[Event] = []
+    serial = 0
 
-        unique_hosts = {item.dst_ip for item in current}
-        if len(unique_hosts) >= threshold and key not in alerted_groups:
-            alerts.append(
-                Alert(
-                    rule="horizontal_scan",
-                    src_ip=event.src_ip,
-                    target=f"destination port {event.dst_port}",
-                    first_seen=current[0].timestamp,
-                    last_seen=event.timestamp,
-                    event_count=len(unique_hosts),
-                    description=(
-                        f"Destination port {event.dst_port} on "
-                        f"{len(unique_hosts)} hosts within the time window"
-                    ),
-                )
-            )
-            alerted_groups.add(key)
+    def flow(event: Event) -> tuple[str, str, int, int | None]:
+        return event.src_ip, event.dst_ip, event.dst_port, event.src_port
 
-    return alerts
+    def expire(now: datetime, inclusive: bool) -> None:
+        while deadlines:
+            number, event = deadlines[0]
+            age = now - event.timestamp
+            if age < timeout or (age == timeout and not inclusive):
+                break
+            deadlines.popleft()
+            key = flow(event)
+            attempts = pending.get(key)
+            if attempts is not None and number in attempts:
+                expired.append(attempts.pop(number))
+                if not attempts:
+                    del pending[key]
 
-
-def _detect_syn_only(
-    events: list[Event], window: timedelta, threshold: int
-) -> list[Alert]:
-    """Find many SYNs from a source that have no later matching ACK event."""
-    windows: dict[str, deque[Event]] = {}
-    alerted_sources: set[str] = set()
-    alerts: list[Alert] = []
-
-    for event in events:
-        current = windows.setdefault(event.src_ip, deque())
-        _remove_expired(current, event.timestamp, window)
-        if not current:
-            alerted_sources.discard(event.src_ip)
-
-        if _has_flag(event.flags, "ACK"):
-            current = deque(
-                pending
-                for pending in current
-                if not (
-                    pending.dst_ip == event.dst_ip
-                    and pending.dst_port == event.dst_port
-                    and (
-                        pending.src_port is None
-                        or event.src_port is None
-                        or pending.src_port == event.src_port
-                    )
-                    and pending.timestamp < event.timestamp
-                )
-            )
-            windows[event.src_ip] = current
-            if not current:
-                alerted_sources.discard(event.src_ip)
-
-        if _has_flag(event.flags, "SYN") and not _has_flag(event.flags, "ACK"):
-            current.append(event)
-
-        if len(current) >= threshold and event.src_ip not in alerted_sources:
-            alerts.append(
-                Alert(
-                    rule="syn_without_ack",
-                    src_ip=event.src_ip,
-                    target="multiple destinations or ports",
-                    first_seen=current[0].timestamp,
-                    last_seen=event.timestamp,
-                    event_count=len(current),
-                    description=(
-                        f"{len(current)} SYN events without a later matching "
-                        "ACK in the time window"
-                    ),
-                )
-            )
-            alerted_sources.add(event.src_ip)
-
-    return alerts
+    for timestamp, batch in groupby(events, key=lambda event: event.timestamp):
+        expire(timestamp, inclusive=False)
+        simultaneous = list(batch)
+        for event in simultaneous:
+            if _is_probe(event):
+                serial += 1
+                pending.setdefault(flow(event), {})[serial] = event
+                deadlines.append((serial, event))
+        for event in simultaneous:
+            if _has_flag(event.flags, "ACK"):
+                pending.pop(flow(event), None)
+        expire(timestamp, inclusive=True)
+    return expired
 
 
 def detect_scans(
@@ -174,24 +144,38 @@ def detect_scans(
     vertical_threshold: int = 20,
     horizontal_threshold: int = 20,
     syn_threshold: int = 20,
+    syn_ack_timeout_seconds: int = 5,
 ) -> list[Alert]:
-    """Run all scan rules and return alerts in detection-time order.
+    """Analyze sorted TCP events; report one alert per threshold crossing.
 
-    Events are sorted by timestamp before analysis. Each rule keeps a rolling
-    window: before adding the current event, it removes events older than the
-    configured duration.
+    Windows include both endpoints. SYN timeouts use the last observed TCP
+    timestamp, never wall-clock time. Counts are snapshots, not scan totals.
     """
-    if window_seconds <= 0:
-        raise ValueError("window_seconds must be greater than zero")
-    if min(vertical_threshold, horizontal_threshold, syn_threshold) <= 0:
-        raise ValueError("all detection thresholds must be greater than zero")
-
-    ordered_events = sorted(events, key=lambda item: item.timestamp)
-    window = timedelta(seconds=window_seconds)
-
-    alerts = [
-        *_detect_vertical(ordered_events, window, vertical_threshold),
-        *_detect_horizontal(ordered_events, window, horizontal_threshold),
-        *_detect_syn_only(ordered_events, window, syn_threshold),
-    ]
-    return sorted(alerts, key=lambda item: item.last_seen)
+    settings = (window_seconds, vertical_threshold, horizontal_threshold,
+                syn_threshold, syn_ack_timeout_seconds)
+    if any(type(value) is not int or value <= 0 for value in settings):
+        raise ValueError("windows, timeouts and thresholds must be positive integers")
+    try:
+        window = timedelta(seconds=window_seconds)
+        timeout = timedelta(seconds=syn_ack_timeout_seconds)
+    except OverflowError as error:
+        raise ValueError("window or timeout is too large") from error
+    ordered = sorted(events, key=lambda event: event.timestamp)
+    probes = [event for event in ordered if _is_probe(event)]
+    alerts = _detect_window(
+        probes, window, vertical_threshold, "vertical_scan",
+        lambda event: (event.src_ip, event.dst_ip), lambda event: event.dst_port,
+        lambda event: event.dst_ip, "unique destination ports",
+    )
+    alerts += _detect_window(
+        probes, window, horizontal_threshold, "horizontal_scan",
+        lambda event: (event.src_ip, event.dst_port), lambda event: event.dst_ip,
+        lambda event: f"destination port {event.dst_port}", "unique destinations",
+    )
+    alerts += _detect_window(
+        _unacknowledged_syns(ordered, timeout), window, syn_threshold,
+        "syn_without_ack", lambda event: event.src_ip, None,
+        lambda event: "multiple destinations or ports",
+        f"SYN events without ACK within {syn_ack_timeout_seconds} seconds",
+    )
+    return sorted(alerts, key=lambda alert: alert.last_seen)

@@ -19,6 +19,7 @@ class DetectorConfig:
     """Validated settings needed by the detection rules."""
 
     window_seconds: int
+    syn_ack_timeout_seconds: int
     vertical_unique_ports: int
     horizontal_unique_hosts: int
     syn_without_ack: int
@@ -43,7 +44,17 @@ def load_config(path: Path) -> DetectorConfig:
     if not isinstance(raw_thresholds, dict):
         raise ValueError("'thresholds' must be a YAML mapping")
 
+    unknown = set(raw_config) - {"window_seconds", "syn_ack_timeout_seconds", "thresholds"}
+    unknown_thresholds = set(raw_thresholds) - {
+        "vertical_unique_ports", "horizontal_unique_hosts", "syn_without_ack"
+    }
+    if unknown or unknown_thresholds:
+        raise ValueError(f"unknown configuration keys: {unknown or unknown_thresholds}")
+
     return DetectorConfig(
+        syn_ack_timeout_seconds=_positive_integer(
+            raw_config.get("syn_ack_timeout_seconds", 5), "syn_ack_timeout_seconds"
+        ),
         window_seconds=_positive_integer(
             raw_config.get("window_seconds", 60), "window_seconds"
         ),
@@ -65,7 +76,7 @@ def load_config(path: Path) -> DetectorConfig:
 def build_argument_parser() -> argparse.ArgumentParser:
     """Create the argument parser for the command-line interface."""
     argument_parser = argparse.ArgumentParser(
-        description="Detect port-scanning patterns in a network CSV log."
+        description="Detect port-scanning patterns in CSV, PCAP, or PCAPNG files."
     )
     argument_parser.add_argument(
         "--input",
@@ -104,10 +115,13 @@ def main(argv: list[str] | None = None) -> int:
             vertical_threshold=config.vertical_unique_ports,
             horizontal_threshold=config.horizontal_unique_hosts,
             syn_threshold=config.syn_without_ack,
+            syn_ack_timeout_seconds=config.syn_ack_timeout_seconds,
         )
         print_alert_table(alerts)
         if args.output is not None:
-            json_path, csv_path = write_reports(alerts, args.output)
+            json_path, csv_path = write_reports(
+                alerts, args.output, protected_paths=(args.input, args.config)
+            )
             print(f"Saved JSON report to {json_path}")
             print(f"Saved CSV report to {csv_path}")
     except (OSError, RuntimeError, ValueError, yaml.YAMLError) as error:

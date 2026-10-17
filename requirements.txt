@@ -1,6 +1,4 @@
-PyYAML
-pytest
-
-# Optional dependency for pcap input:
-# scapy
-# Install it when needed with: python -m pip install scapy
+# Versions used for the local regression suite.
+PyYAML==6.0.3
+pytest==9.1.1
+# Optional PCAP support: python -m pip install scapy==2.8.0

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import csv
 import ipaddress
+import struct
 import warnings
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,16 +32,19 @@ def _parse_event(row: dict[str, str | None]) -> Event:
 
     src_ip = (row.get("src_ip") or "").strip()
     dst_ip = (row.get("dst_ip") or "").strip()
-    ipaddress.ip_address(src_ip)
-    ipaddress.ip_address(dst_ip)
+    src_ip = str(ipaddress.ip_address(src_ip))
+    dst_ip = str(ipaddress.ip_address(dst_ip))
 
     dst_port = int((row.get("dst_port") or "").strip())
     if not 1 <= dst_port <= 65535:
         raise ValueError("dst_port must be between 1 and 65535")
 
     flags = (row.get("flags") or "").strip().upper()
-    if not flags:
-        raise ValueError("flags must not be empty")
+    tokens = flags.replace(",", " ").split()
+    allowed = {"NS", "CWR", "ECE", "URG", "ACK", "PSH", "RST", "SYN", "FIN", "NONE"}
+    if not tokens or set(tokens) - allowed or ("NONE" in tokens and len(tokens) > 1):
+        raise ValueError("flags must contain valid TCP flag names")
+    flags = ",".join(tokens)
 
     return Event(
         timestamp=timestamp.astimezone(timezone.utc),
@@ -60,24 +64,38 @@ def parse_csv(path: str | Path) -> list[Event]:
     """
     events: list[Event] = []
 
-    with Path(path).open("r", encoding="utf-8", newline="") as csv_file:
-        reader = csv.DictReader(csv_file)
+    with Path(path).open("r", encoding="utf-8-sig", newline="") as csv_file:
+        reader = csv.DictReader(csv_file, strict=True)
         required_columns = {"timestamp", "src_ip", "dst_ip", "dst_port", "flags"}
-        header = set(reader.fieldnames or [])
-        missing_columns = required_columns - header
-        if missing_columns:
-            missing_text = ", ".join(sorted(missing_columns))
-            raise ValueError(f"CSV is missing required columns: {missing_text}")
+        try:
+            columns = reader.fieldnames or []
+            missing_columns = required_columns - set(columns)
+            if missing_columns:
+                raise ValueError(f"CSV is missing required columns: {', '.join(sorted(missing_columns))}")
+            if len(columns) != len(set(columns)):
+                raise ValueError("CSV header contains duplicate columns")
 
-        for line_number, row in enumerate(reader, start=2):
-            try:
-                events.append(_parse_event(row))
-            except (AttributeError, TypeError, ValueError) as error:
-                warnings.warn(
-                    f"Skipping malformed CSV row {line_number}: {error}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            while True:
+                try:
+                    row = next(reader)
+                except StopIteration:
+                    break
+                try:
+                    if None in row or any(value is None for value in row.values()):
+                        raise ValueError("wrong number of CSV fields; quote flags such as \"SYN,ACK\"")
+                    events.append(_parse_event(row))
+                except (AttributeError, TypeError, ValueError, OverflowError) as error:
+                    warnings.warn(
+                        f"Skipping malformed CSV row {reader.line_num}: {error}",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
+        except csv.Error as error:
+            # A broken quoted record may span lines; resuming would guess at
+            # record boundaries. Fail explicitly instead of reporting success.
+            raise ValueError(
+                f"CSV structure error near line {reader.line_num}: {error}; analysis incomplete"
+            ) from error
 
     return events
 
@@ -118,7 +136,7 @@ def parse_pcap(path: str | Path) -> list[Event]:
     pcap_path = Path(path)
     try:
         reader = PcapReader(str(pcap_path))
-    except (OSError, Scapy_Exception) as error:
+    except (OSError, Scapy_Exception, EOFError, struct.error) as error:
         raise ValueError(f"cannot open pcap file '{pcap_path}': {error}") from error
 
     events: list[Event] = []
@@ -126,13 +144,10 @@ def parse_pcap(path: str | Path) -> list[Event]:
         while True:
             try:
                 packet = reader.read_packet()
-            except Scapy_Exception as error:
-                warnings.warn(
-                    f"Stopping at an unreadable pcap packet: {error}",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            except EOFError:
                 break
+            except (Scapy_Exception, struct.error) as error:
+                raise ValueError(f"Unreadable pcap packet; analysis incomplete: {error}") from error
 
             if packet is None:
                 break
@@ -155,8 +170,8 @@ def parse_pcap(path: str | Path) -> list[Event]:
                         timestamp=datetime.fromtimestamp(
                             float(packet.time), tz=timezone.utc
                         ),
-                        src_ip=source_ip,
-                        dst_ip=destination_ip,
+                        src_ip=str(ipaddress.ip_address(source_ip)),
+                        dst_ip=str(ipaddress.ip_address(destination_ip)),
                         src_port=int(tcp_layer.sport),
                         dst_port=int(tcp_layer.dport),
                         flags=_tcp_flags_to_names(int(tcp_layer.flags)),

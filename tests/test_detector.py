@@ -100,6 +100,7 @@ def test_syn_without_ack_is_detected() -> None:
         for index in range(20)
     ]
 
+    events.append(make_event(25, "192.0.2.99", "198.51.100.99", 443, "ACK"))
     alerts = detect_scans(events)
 
     assert any(alert.rule == "syn_without_ack" for alert in alerts)

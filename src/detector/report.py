@@ -52,7 +52,9 @@ def print_alert_table(alerts: list[Alert]) -> None:
     print(format_alert_table(alerts))
 
 
-def write_reports(alerts: list[Alert], output_base: Path) -> tuple[Path, Path]:
+def write_reports(
+    alerts: list[Alert], output_base: Path, *, protected_paths: tuple[Path, ...] = ()
+) -> tuple[Path, Path]:
     """Write JSON and CSV reports using output_base as their shared name.
 
     If output_base ends in .json or .csv, that suffix is removed before both
@@ -62,8 +64,17 @@ def write_reports(alerts: list[Alert], output_base: Path) -> tuple[Path, Path]:
     if output_base.suffix.lower() in {".json", ".csv"}:
         output_base = output_base.with_suffix("")
 
-    json_path = output_base.with_suffix(".json")
-    csv_path = output_base.with_suffix(".csv")
+    json_path = Path(str(output_base) + ".json")
+    csv_path = Path(str(output_base) + ".csv")
+    outputs = (json_path, csv_path)
+    for output in outputs:
+        for protected in protected_paths:
+            if output.resolve() == protected.resolve() or (
+                output.exists() and protected.exists() and output.samefile(protected)
+            ):
+                raise ValueError(f"report path would overwrite input or configuration: {output}")
+    if json_path.exists() and csv_path.exists() and json_path.samefile(csv_path):
+        raise ValueError("JSON and CSV output paths refer to the same file")
     json_path.parent.mkdir(parents=True, exist_ok=True)
 
     rows = [_alert_to_dict(alert) for alert in alerts]

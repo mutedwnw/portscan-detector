@@ -8,7 +8,7 @@ Use the private or host-only network between your own lab VMs.
 Activate the project's virtual environment, then run:
 
 ```bash
-python -m pip install scapy
+python -m pip install scapy==2.8.0
 ```
 
 Scapy is optional. CSV input continues to work without it.
@@ -38,7 +38,11 @@ In terminal 2, scan that same VM:
 sudo nmap -sS -n -p 1-100 <target-ip>
 ```
 
-After Nmap finishes, return to terminal 1 and press `Ctrl+C` to close the capture.
+After Nmap finishes, keep observing for longer than `syn_ack_timeout_seconds`
+(default 5 seconds). Generate a normal connection to a known service on your
+own target VM after that delay, so the recording contains a later TCP event.
+Then return to terminal 1 and press `Ctrl+C` to close the capture. Waiting alone
+without any later TCP traffic does not advance this detector's observation end.
 
 ## 4. Capture a TCP connect scan
 
@@ -54,7 +58,7 @@ Then, in terminal 2, run:
 nmap -sT -n -p 1-100 <target-ip>
 ```
 
-Stop the capture with `Ctrl+C` after the scan completes.
+Use the same observation-tail procedure as above, then stop with `Ctrl+C`.
 
 ## 5. Analyze both captures
 
@@ -77,3 +81,15 @@ an approximation for CSV. PCAP events include the source port and allow a more
 specific match. Closed or filtered ports, packet loss, retransmissions, and the
 configured threshold can still affect the alerts; compare the packet captures
 and reports rather than treating the result as proof by itself.
+
+
+## Interpretation
+
+Only initial SYN packets contribute to vertical/horizontal scans; replies to
+client ephemeral ports do not make the server a scanner. The SYN rule waits
+for the configured ACK timeout and ignores attempts too close to the last TCP
+event to evaluate. ACKs at the exact deadline are accepted; later ACKs do not
+undo a timeout. `-sT` against closed or filtered ports can still produce SYN
+alerts, and `-sS` is not the only cause of incomplete handshakes. Neither an
+alert nor its absence reliably identifies the Nmap mode. Use the captures to
+explain what actually happened.
