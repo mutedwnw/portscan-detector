@@ -1,0 +1,6 @@
+PyYAML
+pytest
+
+# Optional dependency for pcap input:
+# scapy
+# Install it when needed with: python -m pip install scapy

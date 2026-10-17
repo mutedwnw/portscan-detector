@@ -1,0 +1,6 @@
+window_seconds: 60
+
+thresholds:
+  vertical_unique_ports: 20
+  horizontal_unique_hosts: 20
+  syn_without_ack: 20
