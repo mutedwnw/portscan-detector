@@ -1,4 +1,163 @@
-# Port Scan Detector
+# Port Scan Detector en
+
+An educational tool for detecting signs of port scanning in network logs. It reads CSV or pcap files, looks for several common behavior patterns, and writes alerts to the console, JSON, and CSV. The project is intended for learning and for testing with data from your own lab.
+
+Detections are mapped to MITRE ATT&CK [T1046 — Network Service Discovery](https://attack.mitre.org/techniques/T1046/).
+
+## What the detector looks for
+
+All rules use a sliding time window. By default, the window is 60 seconds and the thresholds are 20 events or unique values:
+
+- **Vertical scan:** one source contacts many unique ports on a single destination address.
+- **Horizontal scan:** one source contacts the same port on many destination addresses.
+- **SYN without a subsequent ACK:** SYN events accumulate from one source, with no later ACK found in the same direction and flow.
+
+A single traffic flow can match multiple rules and generate multiple alerts. Each alert includes a `mitre` field with the value `T1046`.
+
+## Requirements
+
+- Python 3.11 or later
+- PyYAML for reading the configuration
+- pytest for running tests
+- Scapy — optional package for reading pcap/pcapng files
+
+## Installation
+
+Go to the project directory, create a virtual environment, and install the main dependencies:
+
+```bash
+cd portscan-detector
+python3 --version
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements.txt
+```
+
+Make sure `python3 --version` shows Python 3.11 or later. If you have multiple Python versions installed, create the environment with the required version explicitly, for example:
+
+```bash
+python3.11 -m venv .venv
+```
+
+To read pcap files, install Scapy in the activated environment:
+
+```bash
+python -m pip install scapy
+```
+
+## CSV format
+
+The CSV file must have a header and columns in this format:
+
+```csv
+timestamp,src_ip,dst_ip,dst_port,flags
+2026-01-01T12:00:00Z,203.0.113.10,198.51.100.10,443,SYN
+```
+
+The `timestamp` field must include the date, time, and time zone. The `flags` field contains TCP flag names, such as `SYN`, `ACK`, or `SYN,ACK`. An invalid row triggers a warning and is skipped. An invalid header or an inaccessible file stops the program with an error message.
+
+## Examples
+
+Run the detector on a CSV file using settings from `config.yaml`:
+
+```bash
+PYTHONPATH=src python -m detector.cli \
+  --input samples/events.csv \
+  --config config.yaml
+```
+
+Print a table to the console and save both file reports:
+
+```bash
+PYTHONPATH=src python -m detector.cli \
+  --input samples/events.csv \
+  --config config.yaml \
+  --output reports/alerts
+```
+
+The command creates `reports/alerts.json` and `reports/alerts.csv`. The input file extension determines which parser is used: `.pcap` and `.pcapng` files are read with Scapy; other extensions are treated as CSV.
+
+Regenerate the sample CSV:
+
+```bash
+python samples/generate_samples.py
+```
+
+## Example output
+
+Rules can overlap in `samples/events.csv`: the vertical and horizontal scan scenarios also contain SYN events without ACKs. As a result, the example produces more than three alerts.
+
+```text
+Rule            | Source IP    | Target                         | Count | First seen                | Last seen                 | MITRE
+----------------+--------------+--------------------------------+-------+---------------------------+---------------------------+------
+vertical_scan   | 203.0.113.10 | 198.51.100.10                  | 20    | 2026-01-01T12:00:40+00:00 | 2026-01-01T12:01:18+00:00 | T1046
+syn_without_ack | 203.0.113.10 | multiple destinations or ports | 20    | 2026-01-01T12:00:40+00:00 | 2026-01-01T12:01:18+00:00 | T1046
+horizontal_scan | 203.0.113.20 | destination port 445           | 20    | 2026-01-01T12:01:40+00:00 | 2026-01-01T12:02:18+00:00 | T1046
+syn_without_ack | 203.0.113.20 | multiple destinations or ports | 20    | 2026-01-01T12:01:40+00:00 | 2026-01-01T12:02:18+00:00 | T1046
+syn_without_ack | 203.0.113.30 | multiple destinations or ports | 20    | 2026-01-01T12:02:40+00:00 | 2026-01-01T12:03:18+00:00 | T1046
+```
+
+Times in the report are shown in UTC.
+
+## Configuring thresholds
+
+Open `config.yaml`. For example, to change the window and thresholds, edit the numbers:
+
+```yaml
+window_seconds: 60
+
+thresholds:
+  vertical_unique_ports: 20
+  horizontal_unique_hosts: 20
+  syn_without_ack: 20
+```
+
+All values must be positive integers.
+
+## Tests
+
+From the project root, with the virtual environment activated, run:
+
+```bash
+PYTHONPATH=src python -m pytest -q
+```
+
+The tests check that ordinary connections produce no alerts, that each of the three rules detects its scan pattern, and that a malformed CSV row is skipped.
+
+## Lab test with pcap and Nmap
+
+Instructions for capturing your own traffic and comparing `nmap -sS` with `nmap -sT` are in [samples/PCAP_LAB.md](samples/PCAP_LAB.md). Scan only your own virtual machines or systems you have permission to test.
+
+## Limitations
+
+- **Slow scans:** the rules count events only within the configured window. If a scanner spreads its attempts out so the threshold is not reached during that time, the detector may miss it.
+- **IPv6:** the parser and pcap reader accept IPv6 TCP addresses, but IPv6 scenarios do not have separate tests. Fragmentation and other IPv6-specific behavior are not analyzed.
+- **SYN/ACK matching in CSV:** the format does not include a source port, so matching uses an incomplete set of fields. The source port is available in pcap files, but the result still depends on the completeness and quality of the capture.
+- **Threshold heuristics:** alerts are indicators for investigation, not proof of malicious activity. Normal high-volume traffic may also reach a threshold.
+
+## Project structure
+
+```text
+portscan-detector/
+├── src/detector/
+│   ├── parser.py
+│   ├── rules.py
+│   ├── report.py
+│   └── cli.py
+├── config.yaml
+├── samples/
+│   ├── events.csv
+│   ├── generate_samples.py
+│   └── PCAP_LAB.md
+├── tests/
+│   └── test_detector.py
+├── requirements.txt
+├── README.md
+└── .gitignore
+```
+
+# Port Scan Detector ru
 
 Учебный детектор признаков сканирования портов в сетевых логах. Он читает CSV
 или pcap, ищет несколько характерных шаблонов поведения и сохраняет алерты в
